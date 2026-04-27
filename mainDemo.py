@@ -4,11 +4,6 @@ import cv2
 
 robot = CommonRobot(False)
 
-
-def sleep(t):
-    time.sleep(t)
-
-
 def stop_motors():
     robot.motor_speed_0 = 0
     robot.motor_speed_1 = 0
@@ -16,39 +11,39 @@ def stop_motors():
     robot.motor_speed_3 = 0
     robot.motor_speed_4 = 0
     robot.motor_speed_5 = 0
-    sleep(0.3)
 
 
-def turn_right(seconds=1.0, speed=40):
+def turn_right(speed=40):
     robot.motor_speed_0 = speed
     robot.motor_speed_1 = speed
     robot.motor_speed_2 = speed
     robot.motor_speed_3 = speed
     robot.motor_speed_4 = speed
     robot.motor_speed_5 = speed
-    sleep(seconds)
-    stop_motors()
 
 
-def turn_left(seconds=1.0, speed=40):
+def turn_left(speed=40):
     robot.motor_speed_0 = -speed
     robot.motor_speed_1 = -speed
     robot.motor_speed_2 = -speed
     robot.motor_speed_3 = -speed
     robot.motor_speed_4 = -speed
     robot.motor_speed_5 = -speed
-    sleep(seconds)
-    stop_motors()
 
 
 def open_gripper():
-    robot.set_angle_servo(0, 2)
+    robot.set_angle_servo(300, 2)
     sleep(1)
 
 
 def close_gripper():
-    robot.set_angle_servo(90, 2)
-    sleep(1)
+    robot.set_angle_servo(0, 2)
+    
+def lift_up__gripper():
+    robot.set_angle_servo(300, 1)
+    
+def lift_down_gripper():
+    robot.set_angle_servo(30, 1)
 
 
 def show_camera(seconds=10):
@@ -63,22 +58,12 @@ def show_camera(seconds=10):
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-        sleep(0.03)
+        time.sleep(0.03)
 
     cv2.destroyAllWindows()
 
 
 try:
-    for angle in [0, 30, 60, 90, 120, 150, 180]:
-        print("servo 2 angle:", angle)
-        robot.set_angle_servo(angle, 2)
-        time.sleep(1)
-    turn_right(1.0)
-    turn_left(1.0)
-
-    open_gripper()
-    close_gripper()
-
     show_camera(100)
     
 
