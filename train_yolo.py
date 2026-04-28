@@ -8,29 +8,31 @@
 #   classes.txt
 #   data.yaml
 #
+# Новые классы добавлены в конец, поэтому старая разметка не ломается:
+# 0 коробка
+# 1 дерево
+# 2 забор
+# 3 белые полосы дорожной разметки
+# 4 заграждение
+# 5 контейнер
+# 6 бочка
+# 7 рычаг
+#
 # Установка:
 #   pip install ultralytics
 #   pip install torch==2.10.0+cu128 torchaudio==2.10.0+cu128 torchvision==0.25.0+cu128 --index-url https://download.pytorch.org/whl/cu128   
 #
 # Запуск:
-#   python train_yolo.py
-#
-# Более быстрый тест:
-#   python train_yolo.py --epochs 10 --imgsz 640
-#
-# Продолжить обучение с чекпоинта:
-#   python train_yolo.py --model runs/agrobot_yolo/train/weights/last.pt --resume
-#
-# Результаты:
-#   runs/agrobot_yolo/train/weights/best.pt
-#   runs/agrobot_yolo/train/weights/last.pt
+#   python train_yolo.py --device 0 --model yolov8s.pt
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_CLASSES = [
     "коробка",
@@ -39,6 +41,8 @@ DEFAULT_CLASSES = [
     "белые полосы дорожной разметки",
     "заграждение",
     "контейнер",
+    "бочка",
+    "рычаг",
 ]
 
 
@@ -49,8 +53,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--dataset",
-        default="dataset_yolo",
-        help="Папка датасета YOLO. По умолчанию: dataset_yolo",
+        default=str(SCRIPT_DIR / "dataset_yolo"),
+        help="Папка датасета YOLO. По умолчанию: dataset_yolo рядом со скриптом",
     )
     parser.add_argument(
         "--data",
@@ -63,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Стартовая модель/чекпоинт. "
             "Для слабого ПК: yolov8n.pt. "
-            "Точнее, но тяжелее: yolov8s.pt/yolov8m.pt или актуальная модель Ultralytics."
+            "Точнее, но тяжелее: yolov8s.pt/yolov8m.pt."
         ),
     )
     parser.add_argument(
@@ -86,10 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default=None,
-        help=(
-            "Устройство: 0 для первой NVIDIA GPU, cpu для процессора, "
-            "mps для Apple Silicon. Если не указано, Ultralytics выберет сам."
-        ),
+        help="Устройство: 0 для первой NVIDIA GPU, cpu для процессора. Если не указано, Ultralytics выберет сам.",
     )
     parser.add_argument(
         "--workers",
@@ -99,8 +100,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--project",
-        default=str((Path(__file__).resolve().parent / "runs" / "agrobot_yolo").resolve()),
-        help="Папка для результатов. По умолчанию: runs/agrobot_yolo",
+        default=str((SCRIPT_DIR / "runs" / "agrobot_yolo").resolve()),
+        help="Папка для результатов. По умолчанию: runs/agrobot_yolo рядом со скриптом",
     )
     parser.add_argument(
         "--name",
@@ -139,14 +140,30 @@ def parse_args() -> argparse.Namespace:
 
 def read_classes(classes_path: Path) -> List[str]:
     if not classes_path.exists():
-        return DEFAULT_CLASSES
+        return DEFAULT_CLASSES.copy()
 
     classes = [
         line.strip()
         for line in classes_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    return classes or DEFAULT_CLASSES
+    return classes or DEFAULT_CLASSES.copy()
+
+
+def merge_classes(existing: List[str]) -> Tuple[List[str], bool]:
+    """Сохраняет старые id классов и дописывает недостающие классы в конец."""
+    merged = list(existing)
+    changed = False
+    for name in DEFAULT_CLASSES:
+        if name not in merged:
+            merged.append(name)
+            changed = True
+    return merged, changed
+
+
+def write_classes_file(classes_path: Path, classes: List[str]) -> None:
+    classes_path.parent.mkdir(parents=True, exist_ok=True)
+    classes_path.write_text("\n".join(classes) + "\n", encoding="utf-8")
 
 
 def yaml_quote(text: str) -> str:
@@ -154,12 +171,11 @@ def yaml_quote(text: str) -> str:
     return f'"{escaped}"'
 
 
-def ensure_data_yaml(dataset_dir: Path, data_yaml: Path) -> None:
-    """Создаёт data.yaml, если его нет.
+def ensure_data_yaml(dataset_dir: Path, data_yaml: Path) -> List[str]:
+    """Обновляет classes.txt и data.yaml, не удаляя images/labels.
 
-    Поддерживает структуру:
-      dataset_yolo/images/train
-      dataset_yolo/labels/train
+    Это именно дополняет существующий dataset_yolo: старые id 0..5 остаются на местах,
+    новые классы становятся id 6 и 7.
     """
     images_train = dataset_dir / "images" / "train"
     labels_train = dataset_dir / "labels" / "train"
@@ -170,24 +186,30 @@ def ensure_data_yaml(dataset_dir: Path, data_yaml: Path) -> None:
     if not labels_train.exists():
         raise FileNotFoundError(f"Не найдена папка с label-файлами: {labels_train}")
 
-    classes = read_classes(classes_path)
+    existing_classes = read_classes(classes_path)
+    classes, changed = merge_classes(existing_classes)
+    write_classes_file(classes_path, classes)
 
-    if data_yaml.exists():
-        print(f"[OK] Использую существующий data.yaml: {data_yaml}")
-        return
+    if changed:
+        print(f"[OK] classes.txt дополнен новыми классами: {classes_path}")
+    else:
+        print(f"[OK] classes.txt синхронизирован: {classes_path}")
 
     names_block = "\n".join(f"  {i}: {yaml_quote(name)}" for i, name in enumerate(classes))
-
-    content = f"""# Автоматически создано train_yolo.py
+    content = f"""# Автоматически обновлено train_yolo.py
 path: {yaml_quote(str(dataset_dir.resolve()))}
 train: images/train
 val: images/train
+nc: {len(classes)}
 
 names:
 {names_block}
 """
+    data_yaml.parent.mkdir(parents=True, exist_ok=True)
     data_yaml.write_text(content, encoding="utf-8")
-    print(f"[OK] Создан data.yaml: {data_yaml}")
+    print(f"[OK] data.yaml обновлён под текущий dataset_yolo: {data_yaml}")
+
+    return classes
 
 
 def count_files(folder: Path, suffixes: tuple[str, ...]) -> int:
@@ -196,7 +218,7 @@ def count_files(folder: Path, suffixes: tuple[str, ...]) -> int:
     return sum(1 for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in suffixes)
 
 
-def check_dataset(dataset_dir: Path) -> None:
+def check_dataset(dataset_dir: Path, classes: List[str]) -> None:
     images_dir = dataset_dir / "images" / "train"
     labels_dir = dataset_dir / "labels" / "train"
 
@@ -205,20 +227,39 @@ def check_dataset(dataset_dir: Path) -> None:
 
     print(f"[DATASET] images/train: {image_count} изображений")
     print(f"[DATASET] labels/train: {label_count} файлов разметки")
+    print(f"[DATASET] classes: {len(classes)} ({', '.join(classes)})")
 
     if image_count == 0:
-        raise RuntimeError(
-            "В датасете нет изображений. Сначала разметь кадры аннотатором."
-        )
+        raise RuntimeError("В датасете нет изображений. Сначала разметь кадры аннотатором.")
     if label_count == 0:
-        raise RuntimeError(
-            "В датасете нет label-файлов. Проверь, что кадры сохранялись с bbox-разметкой."
-        )
+        raise RuntimeError("В датасете нет label-файлов. Проверь, что кадры сохранялись с bbox-разметкой.")
 
     if label_count < image_count:
         print(
             "[WARN] label-файлов меньше, чем изображений. "
             "Это нормально только если часть кадров сохранена без объектов."
+        )
+
+    max_class_id = -1
+    bad_lines = 0
+    for label_file in labels_dir.rglob("*.txt"):
+        for line in label_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            try:
+                class_id = int(float(parts[0]))
+            except Exception:
+                bad_lines += 1
+                continue
+            max_class_id = max(max_class_id, class_id)
+
+    if bad_lines:
+        print(f"[WARN] Строк разметки с нераспознанным class_id: {bad_lines}")
+    if max_class_id >= len(classes):
+        raise RuntimeError(
+            f"В labels есть class_id={max_class_id}, но в classes.txt/data.yaml только {len(classes)} классов."
         )
 
 
@@ -236,11 +277,11 @@ def normalize_batch(batch_arg: str):
 def main() -> int:
     args = parse_args()
 
-    dataset_dir = Path(args.dataset)
-    data_yaml = Path(args.data) if args.data else dataset_dir / "data.yaml"
+    dataset_dir = Path(args.dataset).resolve()
+    data_yaml = Path(args.data).resolve() if args.data else dataset_dir / "data.yaml"
 
-    ensure_data_yaml(dataset_dir, data_yaml)
-    check_dataset(dataset_dir)
+    classes = ensure_data_yaml(dataset_dir, data_yaml)
+    check_dataset(dataset_dir, classes)
 
     try:
         from ultralytics import YOLO
@@ -285,9 +326,9 @@ def main() -> int:
     if args.resume:
         train_kwargs["resume"] = True
 
-    model.train(**train_kwargs)
+    train_results = model.train(**train_kwargs)
 
-    run_dir = Path(args.project) / args.name
+    run_dir = Path(getattr(train_results, "save_dir", Path(args.project) / args.name))
     best_pt = run_dir / "weights" / "best.pt"
     last_pt = run_dir / "weights" / "last.pt"
 

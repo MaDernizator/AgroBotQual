@@ -28,7 +28,7 @@ Tkinter-разметчик видео для YOLO.
     python yolo_tk_annotator.py ./my_videos --out dataset_yolo
 
 Горячие клавиши:
-    1..6       выбрать класс
+    1..8       выбрать класс
     Enter/N    сохранить кадр и перейти дальше
     Space/S    скипнуть кадр без сохранения
     U          удалить последний bbox
@@ -59,6 +59,8 @@ CLASSES = [
     "белые полосы дорожной разметки",
     "заграждение",
     "контейнер",
+    "бочка",
+    "рычаг",
 ]
 
 VIDEO_EXTENSIONS = {".avi", ".mp4", ".mov", ".mkv", ".webm", ".m4v"}
@@ -66,7 +68,7 @@ DEFAULT_SOURCE = "./media"
 DEFAULT_OUT_DIR = "dataset_yolo"
 
 # Цвета только для отображения в интерфейсе.
-BOX_COLORS = ["#ff4040", "#35b779", "#4aa3ff", "#ffd43b", "#b197fc", "#ff922b"]
+BOX_COLORS = ["#ff4040", "#35b779", "#4aa3ff", "#ffd43b", "#b197fc", "#ff922b", "#20c997", "#f783ac"]
 
 
 @dataclass
@@ -134,7 +136,7 @@ def write_dataset_files(out_dir: Path) -> None:
 
     names_yaml = "\n".join(f"  {i}: {name!r}" for i, name in enumerate(CLASSES))
     data_yaml = (
-        "path: .\n"
+        f"path: {out_dir.resolve().as_posix()}\n"
         "train: images/train\n"
         "val: images/train\n"
         f"nc: {len(CLASSES)}\n"
