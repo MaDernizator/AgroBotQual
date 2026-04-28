@@ -218,3 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 media
+runs
+dataset_yolo
+yolo26n.pt
+yolov8s.pt

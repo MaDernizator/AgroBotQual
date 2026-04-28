@@ -1,3 +1,4 @@
 robocad-py
 opencv-python 
 pynput
+pillow
