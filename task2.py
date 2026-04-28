@@ -215,22 +215,40 @@ def detect_obstacle_ahead(frame):
     return ratio > 0.05   # порог с хорошим запасом (забор даёт 0.09+, дорога 0.002)
 
 def detect_lever(frame, save_debug=False):
-    """
-    Детектирует рычаг по рыжему/оранжевому цвету.
-    Возвращает (direction, debug_frame) или (None, debug_frame).
-    """
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Рыжий/оранжевый: H=5-25, S>80, V>30
-    # Нижнюю часть (земля под роботом) отрезаем
-    mask = cv2.inRange(hsv, np.array([5, 80, 30]), np.array([25, 255, 180]))
-    mask[int(h * 0.85):, :] = 0   # убираем самый низ
-    mask[:int(h * 0.10), :] = 0   # убираем самый верх
+    # Яркий оранжевый: рычаг намного насыщеннее забора
+    mask = cv2.inRange(hsv, np.array([5, 150, 100]), np.array([25, 255, 255]))
+
+    # Убираем верх (небо) и самый низ (земля под роботом)
+    mask[:int(h * 0.10), :] = 0
+    mask[int(h * 0.85):, :] = 0
 
     debug = frame.copy()
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if cv2.countNonZero(mask) < 100:
+    best = None
+    best_area = 0
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 500:
+            continue
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        aspect = cw / max(ch, 1)
+
+        # Рычаг — горизонтальный прямоугольник (aspect > 2.0)
+        # Ромбы забора — квадратные (aspect ≈ 1.0)
+        if aspect < 2.0:
+            continue
+
+        cv2.rectangle(debug, (x, y), (x+cw, y+ch), (0, 180, 80), 1)
+        if area > best_area:
+            best_area = area
+            best = (x, y, cw, ch)
+
+    if best is None:
         cv2.putText(debug, "LEVER: none", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         if save_debug:
@@ -238,14 +256,13 @@ def detect_lever(frame, save_debug=False):
             cv2.imwrite("lever_mask.png", mask)
         return None, debug
 
-    coords = np.where(mask > 0)
-    cx = int(np.mean(coords[1]))
-    cy = int(np.mean(coords[0]))
+    x, y, cw, ch = best
+    cx = x + cw / 2
     direction = (cx - w / 2) / (w / 2)
 
-    cv2.circle(debug, (cx, cy), 8, (0, 255, 255), -1)
+    cv2.rectangle(debug, (x, y), (x+cw, y+ch), (0, 255, 0), 2)
+    cv2.circle(debug, (int(cx), y + ch // 2), 6, (0, 255, 255), -1)
     cv2.line(debug, (w // 2, 0), (w // 2, h), (255, 255, 0), 1)
-    debug[mask > 0] = [0, 100, 255]   # подсвечиваем найденные пиксели
     cv2.putText(debug, f"LEVER: dir={direction:.2f}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
@@ -804,7 +821,7 @@ print("[Фаза 18] Разворот на 180°...")
 stop()
 time.sleep(0.2)
 set_drive(-50, 50)
-time.sleep(TURN_TIME * 2)       # два раза по TURN_TIME ≈ 180°
+time.sleep(TURN_TIME * 2 + 0.05)       # два раза по TURN_TIME ≈ 180°
 stop()
 time.sleep(0.3)
 
@@ -920,17 +937,17 @@ while time.time() - start < 60:
 stop()
 
 print("  Опускаем лифт...")
-robot.set_angle_servo(5, 1)     # лифт вниз (0 = низ)
+robot.set_angle_servo(30, 1)     # лифт вниз (0 = низ)
 time.sleep(2.0)
 
 # Закрываем клешню
 print("  Открываем клешню...")
-robot.set_angle_servo(300, 2)     # клешня закрыта (0 = закрыто)
+robot.set_angle_servo(0, 2)     # клешня закрыта (0 = закрыто)
 time.sleep(1.5)
 
 print("Рычаг найден, наезжаем...")
 start = time.time()
-while time.time() - start < 15:
+while time.time() - start < 10:
     frame = robot.camera_image
     if frame is None:
         time.sleep(0.05)
@@ -944,17 +961,26 @@ while time.time() - start < 15:
     if direction is None:
         # Рычаг пропал — скорее всего уже под роботом
         print("Рычаг под роботом — стоп!")
+        set_drive(50, 50)
+        time.sleep(2)
+        stop()
         break
 
     # Едем на рычаг: коррекция по direction как у ящика
     correction = direction * K_BOX
-    left  = max(-100, min(100, APPROACH_SPEED + correction))
-    right = max(-100, min(100, APPROACH_SPEED - correction))
+    left  = max(-100, min(100, APPROACH_SPEED + 20 + correction))
+    right = max(-100, min(100, APPROACH_SPEED + 20 - correction))
     set_drive(left, right)
     time.sleep(0.05)
 
 stop()
 
+
+set_drive(-50, -50)
+time.sleep(3)
+stop()
+robot.set_angle_servo(300, 1)     # лифт вниз (0 = низ)
+time.sleep(2.0)
 print("[Фаза 15] Рычаг активирован.")
 
 turn_to_yaw(snap_yaw(robot.yaw + 90))
@@ -972,8 +998,8 @@ while time.time() - start < 60:
                 break
 
     correction = cam_error * K_CAMERA if cam_error is not None else 0
-    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
-    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    left  = max(-100, min(100, 40 + correction))
+    right = max(-100, min(100, 40 - correction))
     set_drive(left, right)
 
     if frame is not None:
@@ -981,10 +1007,12 @@ while time.time() - start < 60:
         cv2.waitKey(1)
 
     time.sleep(0.05)
-
-turn_to_yaw(snap_yaw(robot.yaw - 90))
-drive_forward_yaw(snap_yaw(robot.yaw))
+set_drive(50, 50)
+time.sleep(2)
+stop()
 turn_to_yaw(snap_yaw(robot.yaw + 90))
+drive_forward_yaw(snap_yaw(robot.yaw))
+turn_to_yaw(snap_yaw(robot.yaw - 90))
 drive_forward_yaw(snap_yaw(robot.yaw), 50, 60)
 
 # ================================================================
