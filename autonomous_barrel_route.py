@@ -1,38 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-autonomous_barrel_route_v005.py
-
-Автономный сценарий для Агробота:
-1) поднять захват;
-2) найти бочку спереди через YOLO;
-3) подъехать, раскрыть захват, опустить, схватить, поднять;
-4) повернуть налево и ехать по белой разметке;
-5) найти правое ответвление, повернуть направо;
-6) ехать до следующего правого поворота;
-7) ехать прямо по дороге;
-8) найти правое ответвление / дырку в заборе и повернуть;
-9) найти бочки;
-10) подъехать, опустить и отпустить бочку;
-11) развернуться и ехать на выезд.
-
-ВАЖНО:
-- Файл best.pt должен лежать рядом со скриптом.
-- base_robot_commands.py должен лежать рядом со скриптом.
-- Пока захват опускается/поднимается/открывается/закрывается, детекция НЕ запускается.
-- Если кадра нет, он не передаётся в YOLO, чтобы детекция не ломалась.
-
-Установка:
-    pip install ultralytics opencv-python numpy
-
+"""autonomous_barrel_route_v019.py
+pip:
+    pip install robocad-py ultralytics opencv-python numpy pillow
+    pip install torch==2.10.0+cu128 torchaudio==2.10.0+cu128 torchvision==0.25.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
+проверка что есть gpu:
+    python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'GPU не найден')"
+мой вывод:
+    True
+    NVIDIA GeForce RTX 5060 Ti
+    
 Запуск:
-    python autonomous_barrel_route_v005.py
+    python autonomous_barrel_route_v019.py
+    python autonomous_barrel_route_v019.py --show
 
-Отладка с окном камеры:
-    python autonomous_barrel_route_v005.py --show
+Рядом со скриптом должны лежать:
+    best.pt
+    base_robot_commands.py
 
-Если робот едет слишком долго/коротко, меняй константы в CONFIG.
-Поиск объектов и ответвлений идёт до фактического обнаружения, без аварийного выхода по времени.
+Основные настройки меняются в CONFIG.
 """
 
 from __future__ import annotations
@@ -57,9 +43,6 @@ except Exception:
 import base_robot_commands as cmds
 
 
-# ============================================================
-# НАСТРОЙКИ, КОТОРЫЕ СКОРЕЕ ВСЕГО ПРИДЁТСЯ ПОДКРУЧИВАТЬ
-# ============================================================
 
 @dataclass
 class Config:
@@ -81,16 +64,21 @@ class Config:
     # Подход к бочке/месту сброса.
     # Робот считает, что объект достаточно близко, если bbox занимает
     # достаточную часть высоты/площади кадра.
-    # Для захвата подъезжаем ближе: теперь стоп только когда bbox бочки крупнее.
-    barrel_close_height_ratio: float = 0.46
-    barrel_close_area_ratio: float = 0.145
+    # Для захвата останавливаемся раньше: дальше уже едем с опущенной открытой клешнёй,
+    # чтобы бочка вошла в захват, а не оказалась упёртой прямо перед ним.
+    barrel_close_height_ratio: float = 0.39
+    barrel_close_area_ratio: float = 0.105
     drop_close_height_ratio: float = 0.44
     drop_close_area_ratio: float = 0.13
 
-    # Дополнительный короткий подполз после того, как бочка уже считается близкой.
-    # Помогает реально заехать захватом под объект перед закрытием.
-    pickup_extra_forward_sec: float = 0.03
-    drop_extra_forward_sec: float = 0.05
+    # После открытия и опускания захвата робот едет вперёд без YOLO,
+    # чтобы бочка физически вдавилась в раскрытую клешню.
+    pickup_push_forward_sec: float = 3.00
+    pickup_push_speed: int = 23
+    # Перед сбросом подъезжаем совсем чуть-чуть ближе и немного правее к группе бочек.
+    drop_extra_forward_sec: float = 0.16
+    drop_extra_right_sec: float = 0.22
+    drop_extra_adjust_speed: int = 22
 
     # Центрирование объекта
     center_dead_zone: float = 0.14
@@ -105,6 +93,24 @@ class Config:
     right_branch_x_ratio: float = 0.66
     right_branch_min_area_ratio: float = 0.018
     right_branch_confirm_frames: int = 4
+
+    # Проверка правого ответвления.
+    # Каждые 2.5 секунды движения робот поворачивается направо на 45° и проверяет,
+    # видна ли дорога/цепочка белых чёрточек. Если видна — не возвращается назад,
+    # а сразу едет по этому направлению. Этап с 90° убран.
+    right_branch_probe_interval_sec: float = 2.5
+    right_branch_probe_yaw_deg: float = 45.0
+    right_branch_probe_settle_sec: float = 0.60
+    right_branch_probe_confirm_frames: int = 5
+    right_branch_probe_min_area_ratio: float = 0.010
+    right_branch_probe_center_zone: float = 0.78
+
+    # Если модель видит не одну большую дорогу, а много коротких белых чёрточек,
+    # выстроенных примерно в вертикальную линию, считаем это дорогой после yaw-проверки.
+    right_branch_probe_dash_min_count: int = 3
+    right_branch_probe_dash_min_piece_area_ratio: float = 0.0012
+    right_branch_probe_dash_min_total_area_ratio: float = 0.010
+    right_branch_probe_dash_min_vertical_span_ratio: float = 0.24
 
     # Тайминги механизма захвата.
     # Во время этих пауз YOLO НЕ используется. На --show показывается только сырой кадр камеры.
@@ -121,11 +127,19 @@ class Config:
     reverse_after_drop_sec: float = 1.00
 
     # Тайминги маршрута.
-    # После взятия бочки: строго повернуть налево по yaw на 90° и ехать прямо 10 секунд,
-    # только потом начинать искать правый поворот.
-    after_left_forward_sec: float = 10.0
+    # После взятия бочки: строго повернуть налево по yaw на 90°,
+    # затем 20 секунд ехать уже С ДЕТЕКЦИЕЙ белой линии.
+    # Только после этих 20 секунд начинается поиск правого поворота.
+    after_left_forward_sec: float = 20.0
     # Правые ответвления ищутся БЕЗ ограничения по времени: едем по разметке, пока реально не увидим ответвление.
     straight_by_fence_sec: float = 5.5
+    # После входа в правое ответвление робот едет по дороге это время
+    # и НЕ делает проверок направо. Потом можно начинать следующий поиск.
+    branch_entry_no_right_search_sec: float = 3.0
+
+    # После ПОСЛЕДНЕГО правого ответвления надо не сразу искать бочки,
+    # а нормально заехать в ответвление по белой дороге.
+    final_right_branch_entry_sec: float = 4.5
     exit_line_sec: float = 8.0
 
 
@@ -216,7 +230,7 @@ class Vision:
         if not model_path.exists():
             raise FileNotFoundError(
                 f"Не найден файл модели: {model_path}\n"
-                "Положи обученный best.pt рядом с autonomous_barrel_route_v005.py"
+                "Положи обученный best.pt рядом с autonomous_barrel_route_v019.py"
             )
 
         self.model = YOLO(str(model_path))
@@ -348,9 +362,6 @@ class AutonomousBarrelRoute:
         self.show = show
         self.last_debug_frame: Optional[np.ndarray] = None
 
-    # -------------------------
-    # Низкоуровневое управление
-    # -------------------------
 
     def stop(self, delay: float = 0.05) -> None:
         cmds.stop_motors(self.robot)
@@ -367,6 +378,9 @@ class AutonomousBarrelRoute:
 
     def turn_right(self, speed: Optional[int] = None) -> None:
         cmds.move_right(self.robot, speed if speed is not None else CONFIG.turn_speed)
+
+    def forward_right(self, speed: Optional[int] = None) -> None:
+        cmds.move_forward_right(self.robot, speed if speed is not None else CONFIG.forward_speed)
 
     def steer_forward_to_error(self, error: float, speed: int) -> None:
         """error < 0 значит объект/линия левее центра, error > 0 правее."""
@@ -389,9 +403,6 @@ class AutonomousBarrelRoute:
             time.sleep(CONFIG.loop_sleep)
         self.stop()
 
-    # -------------------------
-    # Захват: во время движения серво камера не используется
-    # -------------------------
 
     def lift_up_no_vision(self) -> None:
         self.stop()
@@ -421,8 +432,44 @@ class AutonomousBarrelRoute:
         print("[ACTION] grab barrel")
         self.open_no_vision()
         self.lift_down_no_vision()
+
+        # Камера в этот момент частично/полностью перекрыта захватом, поэтому YOLO не вызываем.
+        # На --show показывается только сырой кадр камеры.
+        print(
+            f"[ACTION] push barrel into open lowered gripper: "
+            f"{CONFIG.pickup_push_forward_sec:.1f}s speed={CONFIG.pickup_push_speed}"
+        )
+        self.run_for(
+            self.forward,
+            CONFIG.pickup_push_forward_sec,
+            CONFIG.pickup_push_speed,
+            "RAW CAMERA: push barrel into open lowered gripper, YOLO paused",
+        )
+
         self.close_no_vision()
         self.lift_up_no_vision()
+
+    def final_adjust_before_drop(self) -> None:
+        """Финальная коррекция перед сбросом: совсем чуть-чуть ближе и немного правее бочек.
+
+        Делаем только в конце маршрута, поэтому ранний захват первой бочки не меняется.
+        Детекцию не используем: это маленький безопасный манёвр уже после подъезда к зоне сброса.
+        """
+        print("[ACTION] final adjust before drop: closer + a bit right")
+        self.run_for(
+            self.forward,
+            CONFIG.drop_extra_forward_sec,
+            CONFIG.drop_extra_adjust_speed,
+            "final drop adjust: tiny closer",
+        )
+        self.run_for(
+            self.forward_right,
+            CONFIG.drop_extra_right_sec,
+            CONFIG.drop_extra_adjust_speed,
+            "final drop adjust: a bit right",
+        )
+        self.stop(0.15)
+
 
     def drop_barrel_sequence(self) -> None:
         print("[ACTION] drop barrel")
@@ -430,9 +477,6 @@ class AutonomousBarrelRoute:
         self.open_no_vision()
         self.lift_up_no_vision()
 
-    # -------------------------
-    # Зрение и отладка
-    # -------------------------
 
     def sense(self, state_name: str = "") -> Tuple[Optional[np.ndarray], List[Detection]]:
         frame = self.vision.get_frame(self.robot)
@@ -480,9 +524,6 @@ class AutonomousBarrelRoute:
             self.debug_show_raw(state)
             time.sleep(CONFIG.loop_sleep)
 
-    # -------------------------
-    # Движение по объектам
-    # -------------------------
 
     def find_target_by_rotation(self, aliases: set[str], state: str) -> bool:
         """Поворачивается на месте, пока не увидит объект нужного класса."""
@@ -501,13 +542,11 @@ class AutonomousBarrelRoute:
                     print(f"[FOUND] {target.name} conf={target.conf:.2f}")
                     return True
 
-                # Доворачиваем к центру объекта.
                 if error < 0:
                     self.turn_left(CONFIG.search_turn_speed)
                 else:
                     self.turn_right(CONFIG.search_turn_speed)
             else:
-                # Если кадра нет или объекта нет, медленно сканируем.
                 self.turn_left(CONFIG.search_turn_speed)
 
             time.sleep(CONFIG.loop_sleep)
@@ -550,7 +589,6 @@ class AutonomousBarrelRoute:
 
             near_lock = [t for t in targets if lock_distance(t) <= CONFIG.target_lock_max_dist]
             if near_lock:
-                # Среди близких к lock выбираем не дальнюю боковую, а самую фронтальную/крупную.
                 return max(near_lock, key=lambda t: self.target_score_for_approach(t, frame_w, frame_h) - lock_distance(t) * 2.0)
 
         return max(targets, key=lambda t: self.target_score_for_approach(t, frame_w, frame_h))
@@ -577,8 +615,6 @@ class AutonomousBarrelRoute:
             h, w = frame.shape[:2]
             targets = self.vision.filter_by_aliases(detections, aliases)
 
-            # Если любая фронтальная бочка уже достаточно близко, останавливаемся.
-            # Это не даёт роботу проехать мимо ближней бочки и начать ехать к дальней из группы.
             close_front = []
             for t in targets:
                 area_ratio_t = t.area / float(w * h)
@@ -596,8 +632,6 @@ class AutonomousBarrelRoute:
             target = self.choose_target_for_approach(targets, w, h, locked_center)
 
             if target is None:
-                # Если только что видели объект — немного подождать/ползти,
-                # иначе начать поиск поворотом.
                 if time.time() - last_seen < 0.8:
                     self.forward(CONFIG.slow_forward_speed)
                 else:
@@ -607,7 +641,6 @@ class AutonomousBarrelRoute:
 
             last_seen = time.time()
 
-            # Lock обновляем плавно, чтобы не перескакивать на дальнюю соседнюю бочку.
             if locked_center is None:
                 locked_center = (target.cx, target.cy)
                 print(f"[TARGET] locked: {target.name} cx={target.cx:.0f} cy={target.cy:.0f}")
@@ -635,14 +668,10 @@ class AutonomousBarrelRoute:
                 else:
                     cmds.move_forward_right(self.robot, CONFIG.slow_forward_speed)
             else:
-                # В зоне бочек лучше ехать медленно, чтобы не проскочить точку захвата.
                 self.forward(CONFIG.slow_forward_speed)
 
             time.sleep(CONFIG.loop_sleep)
 
-    # -------------------------
-    # Езда по белой разметке / ответвления
-    # -------------------------
 
     def get_line_error_and_branch(self, frame: np.ndarray, detections: List[Detection]) -> Tuple[Optional[float], bool]:
         h, w = frame.shape[:2]
@@ -651,7 +680,6 @@ class AutonomousBarrelRoute:
         if not lines:
             return None, False
 
-        # Для следования берём крупнейшую разметку в нижних 70% кадра.
         lower_lines = [d for d in lines if d.cy > h * 0.30]
         line = self.vision.largest(lower_lines or lines)
 
@@ -660,8 +688,6 @@ class AutonomousBarrelRoute:
 
         error = (line.cx - w / 2) / (w / 2)
 
-        # Ответвление направо: белая разметка/полоса появляется далеко справа
-        # и занимает достаточную площадь.
         right_candidates = [
             d for d in lines
             if d.cx > w * CONFIG.right_branch_x_ratio
@@ -684,7 +710,6 @@ class AutonomousBarrelRoute:
             line_error, _right_branch = self.get_line_error_and_branch(frame, detections)
 
             if line_error is None:
-                # Если разметка потеряна — не паникуем, едем медленно вперёд.
                 self.forward(CONFIG.slow_forward_speed)
             elif abs(line_error) <= CONFIG.line_dead_zone:
                 self.forward(CONFIG.line_speed)
@@ -697,28 +722,137 @@ class AutonomousBarrelRoute:
 
         self.stop()
 
+    def has_visible_road_after_right_probe(self, frame: np.ndarray, detections: List[Detection]) -> bool:
+        """После поворота вправо проверяет, что дорога теперь перед роботом.
+
+        В v011 проверка стала мягче для второго поворота: если YOLO видит не одну
+        большую bbox дороги, а несколько маленьких белых чёрточек, выстроенных
+        почти вертикальной линией, это тоже подтверждает дорогу.
+        """
+        h, w = frame.shape[:2]
+        lines = self.vision.filter_by_aliases(detections, WHITE_LINE_ALIASES)
+        if not lines:
+            print("[BRANCH PROBE] no white line detections")
+            return False
+
+        center_min = w * (0.5 - CONFIG.right_branch_probe_center_zone / 2.0)
+        center_max = w * (0.5 + CONFIG.right_branch_probe_center_zone / 2.0)
+        frame_area = float(w * h)
+
+        centered_front: List[Detection] = []
+        for d in lines:
+            area_ratio = d.area / frame_area
+            centered = center_min <= d.cx <= center_max
+            in_front = d.cy > h * 0.22
+            if centered and in_front:
+                centered_front.append(d)
+                if area_ratio >= CONFIG.right_branch_probe_min_area_ratio:
+                    print(f"[BRANCH PROBE] road by single bbox area={area_ratio:.4f} cx={d.cx/w:.2f} cy={d.cy/h:.2f}")
+                    return True
+
+        dash_candidates = [
+            d for d in centered_front
+            if d.area / frame_area >= CONFIG.right_branch_probe_dash_min_piece_area_ratio
+        ]
+
+        if dash_candidates:
+            total_area_ratio = sum(d.area for d in dash_candidates) / frame_area
+            min_y = min(d.xyxy[1] for d in dash_candidates)
+            max_y = max(d.xyxy[3] for d in dash_candidates)
+            vertical_span_ratio = (max_y - min_y) / max(1.0, float(h))
+            count = len(dash_candidates)
+
+            print(
+                f"[BRANCH PROBE] dash road check count={count} "
+                f"total_area={total_area_ratio:.4f} vspan={vertical_span_ratio:.2f}"
+            )
+
+            if (
+                count >= CONFIG.right_branch_probe_dash_min_count
+                and total_area_ratio >= CONFIG.right_branch_probe_dash_min_total_area_ratio
+                and vertical_span_ratio >= CONFIG.right_branch_probe_dash_min_vertical_span_ratio
+            ):
+                print("[BRANCH PROBE] road by vertical dash chain")
+                return True
+
+        return False
+
+    def wait_after_probe_turn(self, state: str) -> None:
+        """Небольшая пауза после yaw-поворота, чтобы камера/робот стабилизировались."""
+        start = time.time()
+        while time.time() - start < CONFIG.right_branch_probe_settle_sec:
+            self.stop(0.02)
+            self.debug_show_raw(state)
+            time.sleep(CONFIG.loop_sleep)
+
+    def probe_right_road_by_yaw(self, state: str, reason: str, degrees: float) -> bool:
+        """Повернуться направо на degrees и проверить дорогу перед камерой.
+
+        В v015, если после поворота на 45° видна дорога/цепочка белых чёрточек,
+        робот остаётся в этом направлении и сразу едет по этой дороге.
+        Если дороги нет — возвращается обратно влево на тот же угол.
+        """
+        print(f"[BRANCH PROBE] {reason}: right {degrees:.0f} deg and verify road")
+        self.turn_right_by_yaw(degrees, f"{state}: probe right {degrees:.0f}")
+        self.wait_after_probe_turn(f"{state}: settle after right {degrees:.0f}")
+
+        road_frames = 0
+        checked_frames = 0
+        need_checks = max(CONFIG.right_branch_probe_confirm_frames + 4, 8)
+        while checked_frames < need_checks:
+            frame, detections = self.sense(f"{state}: verify road after right {degrees:.0f}")
+            if frame is None:
+                self.stop(0.10)
+                continue
+
+            checked_frames += 1
+            if self.has_visible_road_after_right_probe(frame, detections):
+                road_frames += 1
+            else:
+                road_frames = max(0, road_frames - 1)
+
+            print(
+                f"[BRANCH PROBE] right {degrees:.0f} confirm frames "
+                f"{road_frames}/{CONFIG.right_branch_probe_confirm_frames}"
+            )
+            if road_frames >= CONFIG.right_branch_probe_confirm_frames:
+                self.stop()
+                print("[BRANCH PROBE] road confirmed after right 45, stay turned right and follow it")
+                return True
+
+            self.stop(0.05)
+
+        print(f"[BRANCH PROBE] no confirmed road after right {degrees:.0f}, return back left {degrees:.0f}")
+        self.turn_left_by_yaw(degrees, f"{state}: return from false right {degrees:.0f} probe")
+        self.wait_after_probe_turn(f"{state}: settle after return")
+        return False
+
     def follow_until_right_branch(self, state: str) -> bool:
         print(f"[STATE] {state}: searching right branch without ограничения по времени")
-        branch_frames = 0
+
+        moving_since_last_probe = 0.0
 
         while True:
+            loop_started = time.time()
+
             frame, detections = self.sense(state)
             if frame is None:
                 self.stop(0.10)
-                branch_frames = 0
                 continue
 
-            line_error, right_branch = self.get_line_error_and_branch(frame, detections)
+            line_error, _right_branch = self.get_line_error_and_branch(frame, detections)
 
-            if right_branch:
-                branch_frames += 1
-            else:
-                branch_frames = max(0, branch_frames - 1)
-
-            if branch_frames >= CONFIG.right_branch_confirm_frames:
+            if moving_since_last_probe >= CONFIG.right_branch_probe_interval_sec:
                 self.stop()
-                print("[BRANCH] right branch confirmed")
-                return True
+                if self.probe_right_road_by_yaw(
+                    state,
+                    "periodic 2.5s 45deg probe",
+                    CONFIG.right_branch_probe_yaw_deg,
+                ):
+                    return True
+
+                moving_since_last_probe = 0.0
+                continue
 
             if line_error is None:
                 self.forward(CONFIG.slow_forward_speed)
@@ -730,8 +864,8 @@ class AutonomousBarrelRoute:
                 cmds.move_forward_right(self.robot, CONFIG.correction_speed)
 
             time.sleep(CONFIG.loop_sleep)
+            moving_since_last_probe += time.time() - loop_started
 
-        # Сейчас поиск ответвления без ограничения по времени, поэтому сюда не попадаем.
         self.stop()
         return False
 
@@ -775,13 +909,42 @@ class AutonomousBarrelRoute:
                 continue
 
             delta = self.yaw_delta_deg(yaw, prev_yaw)
-            # Отбрасываем невозможные скачки датчика, чтобы не остановиться случайно.
             if abs(delta) < 45.0:
                 accumulated += delta
             prev_yaw = yaw
 
         self.stop()
         print(f"[YAW] left turn done, accumulated={accumulated:.1f} deg")
+        return True
+
+    def turn_right_by_yaw(self, degrees: float, state: str) -> bool:
+        """Поворачивает направо по yaw на заданный угол без аварийного тайм-лимита."""
+        print(f"[ACTION] right yaw turn: {degrees:.1f} deg, state={state}")
+
+        prev_yaw = self.read_yaw()
+        while prev_yaw is None:
+            self.stop(0.05)
+            self.debug_show_raw(f"{state}: waiting yaw")
+            time.sleep(CONFIG.loop_sleep)
+            prev_yaw = self.read_yaw()
+
+        accumulated = 0.0
+        while abs(accumulated) < degrees:
+            self.turn_right(CONFIG.turn_speed)
+            self.debug_show_raw(f"{state}: yaw {abs(accumulated):.1f}/{degrees:.1f}")
+            time.sleep(CONFIG.loop_sleep)
+
+            yaw = self.read_yaw()
+            if yaw is None:
+                continue
+
+            delta = self.yaw_delta_deg(yaw, prev_yaw)
+            if abs(delta) < 45.0:
+                accumulated += delta
+            prev_yaw = yaw
+
+        self.stop()
+        print(f"[YAW] right turn done, accumulated={accumulated:.1f} deg")
         return True
 
     def turn_right_timed(self, state: str) -> None:
@@ -796,23 +959,17 @@ class AutonomousBarrelRoute:
         print("[ACTION] u-turn")
         self.run_for(self.turn_left, CONFIG.u_turn_sec, CONFIG.turn_speed, "u-turn")
 
-    # -------------------------
-    # Главный сценарий
-    # -------------------------
 
     def run(self) -> None:
         try:
             print("[START] autonomous barrel route")
             self.stop()
 
-            # 1. Поднять захват. Камеру не используем во время движения серво.
             self.lift_up_no_vision()
 
-            # 2. Увидеть бочку спереди.
             if not self.find_target_by_rotation(BARREL_ALIASES, "find first barrel"):
                 return
 
-            # 3. Подъехать, раскрыть, опустить, схватить, поднять.
             if not self.approach_target(
                 BARREL_ALIASES,
                 CONFIG.barrel_close_height_ratio,
@@ -821,33 +978,35 @@ class AutonomousBarrelRoute:
             ):
                 return
 
-            # Подъехать ещё немного ближе, чтобы бочка точно оказалась внутри захвата.
-            self.run_for(self.forward, CONFIG.pickup_extra_forward_sec, CONFIG.slow_forward_speed, "final creep to barrel")
             self.grab_barrel_sequence()
 
-            # 4. Повернуться налево строго по yaw на 90°, затем 10 секунд ехать прямо.
-            # В эти 10 секунд правый поворот НЕ ищем — начинаем искать только после проезда.
             self.turn_left_by_yaw(CONFIG.left_yaw_turn_deg, "turn left 90 by yaw after pickup")
-            self.run_for(self.forward, CONFIG.after_left_forward_sec, CONFIG.line_speed, "forward 10s after yaw left")
+            self.follow_line_for(CONFIG.after_left_forward_sec, "follow white line 20s after yaw left")
 
-            # 5. Только теперь ищем правое ответвление: повернуть и ехать до следующего правого поворота.
             self.follow_until_right_branch("find first right branch")
-            self.turn_right_timed("first right branch")
-            self.follow_until_right_branch("find second right branch")
-            self.turn_right_timed("second right branch")
+            self.follow_line_for(
+                CONFIG.branch_entry_no_right_search_sec,
+                "after first right branch: drive 3s without right probes",
+            )
 
-            # 6. Ехать прямо по дороге, справа вдоль дороги будет забор, но его не видно.
+            self.follow_until_right_branch("find second right branch")
+            self.follow_line_for(
+                CONFIG.branch_entry_no_right_search_sec,
+                "after second right branch: drive 3s without right probes",
+            )
+
             self.follow_line_for(CONFIG.straight_by_fence_sec, "straight by invisible fence")
 
-            # 7-8. Справа ответвление / дырка в заборе: проехать в ответвление.
             self.follow_until_right_branch("find fence hole/right branch")
-            self.turn_right_timed("turn into fence hole")
 
-            # 9. Найти бочки.
+            self.follow_line_for(
+                CONFIG.final_right_branch_entry_sec,
+                "enter final right branch before searching destination barrels",
+            )
+
             if not self.find_target_by_rotation(BARREL_ALIASES, "find destination barrels"):
                 return
 
-            # 10. Подъехать туда и опустить/отпустить бочку.
             if not self.approach_target(
                 BARREL_ALIASES,
                 CONFIG.drop_close_height_ratio,
@@ -856,10 +1015,9 @@ class AutonomousBarrelRoute:
             ):
                 return
 
-            self.run_for(self.forward, CONFIG.drop_extra_forward_sec, CONFIG.slow_forward_speed, "final creep to drop zone")
+            self.final_adjust_before_drop()
             self.drop_barrel_sequence()
 
-            # 11. Развернуться и поехать на выезд.
             self.run_for(self.backward, CONFIG.reverse_after_drop_sec, CONFIG.reverse_speed, "reverse after drop")
             self.u_turn()
             self.follow_line_for(CONFIG.exit_line_sec, "exit by white line")
