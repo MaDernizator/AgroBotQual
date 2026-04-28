@@ -22,6 +22,38 @@ APPROACH_SPEED = 25
 # Вспомогательные функции
 # ================================================================
 
+def snap_yaw(yaw):
+    """Округляет yaw до ближайшего из 0, 90, 180, -90, -180"""
+    steps = [0, 90, 180, -90, -180]
+    return min(steps, key=lambda s: abs((yaw - s + 180) % 360 - 180))
+
+def turn_to_yaw(target_yaw, speed=50, timeout=5.0):
+    """
+    Поворачивает робота до достижения target_yaw (в градусах).
+    Направление выбирается автоматически по кратчайшей дуге.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        current = robot.yaw
+        diff = target_yaw - current
+
+        # Нормализуем в диапазон -180..+180
+        diff = (diff + 180) % 360 - 180
+
+        if abs(diff) < 3:   # допуск ±3°, можно подтянуть
+            break
+
+        # Направление: diff>0 = надо повернуть против часовой, diff<0 = по часовой
+        if diff > 0:
+            set_drive(-speed, speed)   # влево
+        else:
+            set_drive(speed, -speed)   # вправо
+
+        time.sleep(0.02)
+
+    stop()
+    time.sleep(0.1)
+
 def set_drive(left, right):
     robot.motor_speed_0 = left
     robot.motor_speed_1 = left
@@ -52,9 +84,9 @@ def line_follower_correction(s5, s6, s7, s8):
     total = sum(line_vals)
     return weighted_sum / total  # <0 линия левее, >0 правее
 
-def camera_correction(frame):
+def camera_correction(frame, wide=False):
     h, w = frame.shape[:2]
-    y1 = int(h * 0.40)
+    y1 = int(h * (0.15 if wide else 0.40))
     y2 = int(h * 0.70)
     roi = frame[y1:y2, :]
 
@@ -181,6 +213,7 @@ def detect_obstacle_ahead(frame):
 
     ratio = cv2.countNonZero(orange_mask) / (strip.shape[0] * strip.shape[1])
     return ratio > 0.05   # порог с хорошим запасом (забор даёт 0.09+, дорога 0.002)
+
 # ================================================================
 # Фаза 0: поднимаем лифт и открываем клешню
 # ================================================================
@@ -232,13 +265,15 @@ while time.time() - start < 60:
         stop()
         frame = robot.camera_image
         last_check = time.time()
+        while frame is None:
+            frame = robot.camera_image
         if detect_road(frame):
             break
         else:
             set_drive(50, -50)
             time.sleep(TURN_TIME)
             stop()
-
+    print(robot.yaw)
     frame      = robot.camera_image
     cam_error  = None
     if frame is not None:
@@ -340,16 +375,7 @@ while robot.analog_1 < 800 and robot.analog_2 < 800:
 
 stop()
 
-while True:
-    frame = robot.camera_image
-    if frame is None:
-        pass
-    if not detect_obstacle_ahead(frame) and detect_road(frame):
-        break
-    else:
-        set_drive(10, -10)
-        time.sleep(TURN_TIME)
-        stop()
+turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
 set_drive(50, -50)
 
 
@@ -361,9 +387,11 @@ print("[Фаза 7] Едем по линии обратно до стены...")
 start = time.time()
 while time.time() - start < 60 and (robot.analog_1 + robot.analog_2) / 2 < 800:
     frame      = robot.camera_image
-    cam_error  = None
+    cam_error = None
     if frame is not None:
-        cam_error, frame = camera_correction(frame)
+        cam_error, frame = camera_correction(frame)  # сначала обычный режим
+        if cam_error is None:
+            cam_error, frame = camera_correction(frame, wide=True)
 
     correction = cam_error * K_CAMERA if cam_error is not None else 0
     left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
@@ -396,9 +424,396 @@ print("  Открываем клешню...")
 robot.set_angle_servo(300, 2)     # клешня закрыта (0 = закрыто)
 time.sleep(1.5)
 
+robot.set_angle_servo(300, 1)
+time.sleep(2.0)
+
+time.sleep(0.2)
+turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
+stop()
+time.sleep(0.2)
+# ================================================================
+# Фаза 9: Поиск коробки 2
+# ================================================================
+
+CHECK_INTERVAL = 3
+FIRST_CHECK    = True
+FIRST_PASS = True
+last_check     = time.time()
+start          = time.time()
+
+while time.time() - start < 60:
+    if time.time() - last_check > CHECK_INTERVAL:
+        if FIRST_CHECK:
+            FIRST_CHECK    = False
+            CHECK_INTERVAL = 4.0
+        stop()
+        print("Проверяем поворот налево...")
+        set_drive(-50, 50)
+        time.sleep(TURN_TIME)
+        stop()
+        frame = robot.camera_image
+        last_check = time.time()
+        if detect_road(frame) and FIRST_PASS:
+            FIRST_PASS = False
+        elif detect_road(frame):
+            break
+        set_drive(50, -50)
+        time.sleep(TURN_TIME)
+        stop()
+
+
+    frame      = robot.camera_image
+    cam_error  = None
+    if frame is not None:
+        cam_error, frame = camera_correction(frame)
+
+    correction = cam_error * K_CAMERA if cam_error is not None else 0
+    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
+    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    set_drive(left, right)
+
+    if frame is not None:
+        cv2.imshow("АГРОБОТ", frame)
+        cv2.waitKey(1)
+
+    time.sleep(0.05)
+
+
+# ================================================================
+# Фаза 10: Подъезд к ящику со стабилизацией по direction
+# ================================================================
+print("[Фаза 10] Подъезжаем и центрируем ящик...")
+
+start = time.time()
+while time.time() - start < 30:
+    frame = robot.camera_image
+    if frame is None:
+        time.sleep(0.05)
+        continue
+
+    distance, direction, debug_frame = detect_box(frame)
+
+    cv2.imshow("АГРОБОТ", debug_frame)
+    cv2.waitKey(1)
+
+    if distance is None:
+        # Ящик потерян — едем медленно вперёд, ищем
+        set_drive(APPROACH_SPEED, APPROACH_SPEED)
+        time.sleep(0.05)
+        continue
+
+    if distance == 'very_near':
+        # Ящик достаточно близко — переходим к захвату
+        stop()
+        print(f"  Ящик очень близко, direction={direction:.2f} — захватываем!")
+        break
+
+    # Стабилизация: корректируем курс по горизонтальному положению ящика
+    correction = direction * K_BOX
+    left  = max(-100, min(100, APPROACH_SPEED + correction))
+    right = max(-100, min(100, APPROACH_SPEED - correction))
+    set_drive(left, right)
+
+    time.sleep(0.05)
+
+# ================================================================
+# Фаза 11: Захват
+# ================================================================
+print("[Фаза 11] Захват ящика...")
+stop()
+time.sleep(0.3)
+
+# Опускаем лифт
+print("  Опускаем лифт...")
+robot.set_angle_servo(0, 1)     # лифт вниз (0 = низ)
+time.sleep(2.0)
+
+print("Подъехали к ящику")
+set_drive(50, 50)
+time.sleep(2.0)
+stop()
+
+# Закрываем клешню
+print("  Закрываем клешню...")
+robot.set_angle_servo(0, 2)     # клешня закрыта (0 = закрыто)
+time.sleep(1.5)
+
+# Поднимаем лифт с ящиком
+print("  Поднимаем ящик...")
+robot.set_angle_servo(300, 1)   # лифт вверх
+time.sleep(2.0)
+
+set_drive(-50,-50)
+time.sleep(2.0)
+stop()
+print("  Ящик захвачен!")
+
+# ================================================================
+# Фаза 12: Разворот на 180°
+# ================================================================
+print("[Фаза 12] Разворот на 180°...")
+stop()
+time.sleep(0.2)
+set_drive(-50, 50)
+time.sleep(TURN_TIME * 2)       # два раза по TURN_TIME ≈ 180°
+stop()
+time.sleep(0.3)
+
+while robot.analog_1 < 800 and robot.analog_2 < 800:
+    set_drive(40, 40)
+
+stop()
+
+turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
+set_drive(50, -50)
+
+
+# ================================================================
+# Фаза 13: Едем по линии вперёд до стены (analog_1/2 > 800)
+# ================================================================
+print("[Фаза 13] Едем по линии обратно до стены...")
+
+start = time.time()
+while time.time() - start < 60 and (robot.analog_1 + robot.analog_2) / 2 < 800:
+    frame      = robot.camera_image
+    cam_error = None
+    if frame is not None:
+        cam_error, frame = camera_correction(frame)  # сначала обычный режим
+        if cam_error is None:
+            cam_error, frame = camera_correction(frame, wide=True)
+
+    correction = cam_error * K_CAMERA if cam_error is not None else 0
+    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
+    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    set_drive(left, right)
+
+    if frame is not None:
+        cv2.imshow("АГРОБОТ", frame)
+        cv2.waitKey(1)
+
+    time.sleep(0.05)
+
+# ================================================================
+# Фаза 14: Поворот вправо после доставки
+# ================================================================
+print("[Фаза 14] Поворот вправо после доставки...")
+stop()
+time.sleep(0.2)
+set_drive(50, -50)
+time.sleep(TURN_TIME)
+stop()
+time.sleep(0.2)
+
+print("  Опускаем лифт...")
+robot.set_angle_servo(0, 1)     # лифт вниз (0 = низ)
+time.sleep(2.0)
+
+# Закрываем клешню
+print("  Открываем клешню...")
+robot.set_angle_servo(300, 2)     # клешня закрыта (0 = закрыто)
+time.sleep(1.5)
+
+robot.set_angle_servo(300, 1)
+time.sleep(2.0)
+
+time.sleep(0.2)
+turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
+stop()
+time.sleep(0.2)
+
+# ================================================================
+# Фаза 9: Поиск коробки 2
+# ================================================================
+
+CHECK_INTERVAL = 3
+FIRST_CHECK    = True
+FIRST_PASS = True
+last_check     = time.time()
+start          = time.time()
+
+while time.time() - start < 60:
+    if time.time() - last_check > CHECK_INTERVAL:
+        if FIRST_CHECK:
+            FIRST_CHECK    = False
+            CHECK_INTERVAL = 4.0
+        stop()
+        print("Проверяем поворот налево...")
+        set_drive(-50, 50)
+        time.sleep(TURN_TIME)
+        stop()
+        frame = robot.camera_image
+        last_check = time.time()
+        if detect_road(frame) and FIRST_PASS:
+            FIRST_PASS = False
+        elif detect_road(frame):
+            break
+        set_drive(50, -50)
+        time.sleep(TURN_TIME)
+        stop()
+
+
+    frame      = robot.camera_image
+    cam_error  = None
+    if frame is not None:
+        cam_error, frame = camera_correction(frame)
+
+    correction = cam_error * K_CAMERA if cam_error is not None else 0
+    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
+    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    set_drive(left, right)
+
+    if frame is not None:
+        cv2.imshow("АГРОБОТ", frame)
+        cv2.waitKey(1)
+
+    time.sleep(0.05)
+
+
+# ================================================================
+# Фаза 10: Подъезд к ящику со стабилизацией по direction
+# ================================================================
+print("[Фаза 10] Подъезжаем и центрируем ящик...")
+
+start = time.time()
+while time.time() - start < 30:
+    frame = robot.camera_image
+    if frame is None:
+        time.sleep(0.05)
+        continue
+
+    distance, direction, debug_frame = detect_box(frame)
+
+    cv2.imshow("АГРОБОТ", debug_frame)
+    cv2.waitKey(1)
+
+    if distance is None:
+        # Ящик потерян — едем медленно вперёд, ищем
+        set_drive(APPROACH_SPEED, APPROACH_SPEED)
+        time.sleep(0.05)
+        continue
+
+    if distance == 'very_near':
+        # Ящик достаточно близко — переходим к захвату
+        stop()
+        print(f"  Ящик очень близко, direction={direction:.2f} — захватываем!")
+        break
+
+    # Стабилизация: корректируем курс по горизонтальному положению ящика
+    correction = direction * K_BOX
+    left  = max(-100, min(100, APPROACH_SPEED + correction))
+    right = max(-100, min(100, APPROACH_SPEED - correction))
+    set_drive(left, right)
+
+    time.sleep(0.05)
+
+# ================================================================
+# Фаза 11: Захват
+# ================================================================
+print("[Фаза 11] Захват ящика...")
+stop()
+time.sleep(0.3)
+
+# Опускаем лифт
+print("  Опускаем лифт...")
+robot.set_angle_servo(0, 1)     # лифт вниз (0 = низ)
+time.sleep(2.0)
+
+print("Подъехали к ящику")
+set_drive(50, 50)
+time.sleep(2.0)
+stop()
+
+# Закрываем клешню
+print("  Закрываем клешню...")
+robot.set_angle_servo(0, 2)     # клешня закрыта (0 = закрыто)
+time.sleep(1.5)
+
+# Поднимаем лифт с ящиком
+print("  Поднимаем ящик...")
+robot.set_angle_servo(300, 1)   # лифт вверх
+time.sleep(2.0)
+
+set_drive(-50,-50)
+time.sleep(2.0)
+stop()
+print("  Ящик захвачен!")
+
+# ================================================================
+# Фаза 12: Разворот на 180°
+# ================================================================
+print("[Фаза 12] Разворот на 180°...")
+stop()
+time.sleep(0.2)
+set_drive(-50, 50)
+time.sleep(TURN_TIME * 2)       # два раза по TURN_TIME ≈ 180°
+stop()
+time.sleep(0.3)
+
+while robot.analog_1 < 800 and robot.analog_2 < 800:
+    set_drive(40, 40)
+
+stop()
+
+turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
+set_drive(50, -50)
+
+
+# ================================================================
+# Фаза 13: Едем по линии вперёд до стены (analog_1/2 > 800)
+# ================================================================
+print("[Фаза 13] Едем по линии обратно до стены...")
+
+start = time.time()
+while time.time() - start < 60 and (robot.analog_1 + robot.analog_2) / 2 < 800:
+    frame      = robot.camera_image
+    cam_error = None
+    if frame is not None:
+        cam_error, frame = camera_correction(frame)  # сначала обычный режим
+        if cam_error is None:
+            cam_error, frame = camera_correction(frame, wide=True)
+
+    correction = cam_error * K_CAMERA if cam_error is not None else 0
+    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
+    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    set_drive(left, right)
+
+    if frame is not None:
+        cv2.imshow("АГРОБОТ", frame)
+        cv2.waitKey(1)
+
+    time.sleep(0.05)
+
+# ================================================================
+# Фаза 14: Поворот вправо после доставки
+# ================================================================
+print("[Фаза 14] Поворот вправо после доставки...")
+stop()
+time.sleep(0.2)
+set_drive(50, -50)
+time.sleep(TURN_TIME)
+stop()
+time.sleep(0.2)
+
+print("  Опускаем лифт...")
+robot.set_angle_servo(0, 1)     # лифт вниз (0 = низ)
+time.sleep(2.0)
+
+# Закрываем клешню
+print("  Открываем клешню...")
+robot.set_angle_servo(300, 2)     # клешня закрыта (0 = закрыто)
+time.sleep(1.5)
+
+robot.set_angle_servo(300, 1)
+time.sleep(2.0)
+
+time.sleep(0.2)
+turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
+stop()
+time.sleep(0.2)
+
 # ================================================================
 # Финал
 # ================================================================
 stop()
 cv2.destroyAllWindows()
-print("Готово. Ящик доставлен.")
+print("Готово. ")
