@@ -214,8 +214,11 @@ def should_exit() -> bool:
 
 def make_video_path() -> Path:
     script_dir = Path(__file__).resolve().parent
+    media_dir = script_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return script_dir / f"agrobot_record_{stamp}.avi"
+    return media_dir / f"agrobot_record_{stamp}.avi"
 
 
 def open_video_writer(frame: np.ndarray):
