@@ -15,7 +15,7 @@ K_BOX    = 30
 # Коэффициент стабилизации по белой линии (камера)
 K_CAMERA = 25
 # Скорость подъезда к ящику
-APPROACH_SPEED = 25
+APPROACH_SPEED = 20
 
 
 # ================================================================
@@ -213,6 +213,65 @@ def detect_obstacle_ahead(frame):
 
     ratio = cv2.countNonZero(orange_mask) / (strip.shape[0] * strip.shape[1])
     return ratio > 0.05   # порог с хорошим запасом (забор даёт 0.09+, дорога 0.002)
+
+def detect_lever(frame, save_debug=False):
+    """
+    Детектирует рычаг по рыжему/оранжевому цвету.
+    Возвращает (direction, debug_frame) или (None, debug_frame).
+    """
+    h, w = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Рыжий/оранжевый: H=5-25, S>80, V>30
+    # Нижнюю часть (земля под роботом) отрезаем
+    mask = cv2.inRange(hsv, np.array([5, 80, 30]), np.array([25, 255, 180]))
+    mask[int(h * 0.85):, :] = 0   # убираем самый низ
+    mask[:int(h * 0.10), :] = 0   # убираем самый верх
+
+    debug = frame.copy()
+
+    if cv2.countNonZero(mask) < 100:
+        cv2.putText(debug, "LEVER: none", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if save_debug:
+            cv2.imwrite("lever_debug.png", debug)
+            cv2.imwrite("lever_mask.png", mask)
+        return None, debug
+
+    coords = np.where(mask > 0)
+    cx = int(np.mean(coords[1]))
+    cy = int(np.mean(coords[0]))
+    direction = (cx - w / 2) / (w / 2)
+
+    cv2.circle(debug, (cx, cy), 8, (0, 255, 255), -1)
+    cv2.line(debug, (w // 2, 0), (w // 2, h), (255, 255, 0), 1)
+    debug[mask > 0] = [0, 100, 255]   # подсвечиваем найденные пиксели
+    cv2.putText(debug, f"LEVER: dir={direction:.2f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    if save_debug:
+        cv2.imwrite("lever_debug.png", debug)
+        cv2.imwrite("lever_mask.png", mask)
+
+    return direction, debug
+
+def drive_forward_yaw(target_yaw, speed=40, timeout=30.0):
+    """
+    Едет вперёд удерживая target_yaw.
+    stop_condition — функция без аргументов, возвращает True когда надо остановиться.
+    """
+    start = time.time()
+    while time.time() - start < timeout and robot.analog_2 < 800 and robot.analog_1 < 800:
+        current = robot.yaw
+        diff = (target_yaw - current + 180) % 360 - 180
+
+        correction = diff * 1.5   # P-коэффициент, подобрать при необходимости
+
+        left  = max(-100, min(100, speed + correction))
+        right = max(-100, min(100, speed - correction))
+        set_drive(left, right)
+
+    stop()
 
 # ================================================================
 # Фаза 0: поднимаем лифт и открываем клешню
@@ -435,7 +494,7 @@ time.sleep(0.2)
 # Фаза 9: Поиск коробки 2
 # ================================================================
 
-CHECK_INTERVAL = 3
+CHECK_INTERVAL = 3.2
 FIRST_CHECK    = True
 FIRST_PASS = True
 last_check     = time.time()
@@ -622,7 +681,7 @@ stop()
 time.sleep(0.2)
 
 # ================================================================
-# Фаза 9: Поиск коробки 2
+# Фаза 15: Поиск коробки 2
 # ================================================================
 
 CHECK_INTERVAL = 3
@@ -670,9 +729,9 @@ while time.time() - start < 60:
 
 
 # ================================================================
-# Фаза 10: Подъезд к ящику со стабилизацией по direction
+# Фаза 16: Подъезд к ящику со стабилизацией по direction
 # ================================================================
-print("[Фаза 10] Подъезжаем и центрируем ящик...")
+print("[Фаза 16] Подъезжаем и центрируем ящик...")
 
 start = time.time()
 while time.time() - start < 30:
@@ -707,9 +766,9 @@ while time.time() - start < 30:
     time.sleep(0.05)
 
 # ================================================================
-# Фаза 11: Захват
+# Фаза 17: Захват
 # ================================================================
-print("[Фаза 11] Захват ящика...")
+print("[Фаза 17] Захват ящика...")
 stop()
 time.sleep(0.3)
 
@@ -739,9 +798,9 @@ stop()
 print("  Ящик захвачен!")
 
 # ================================================================
-# Фаза 12: Разворот на 180°
+# Фаза 18: Разворот на 180°
 # ================================================================
-print("[Фаза 12] Разворот на 180°...")
+print("[Фаза 18] Разворот на 180°...")
 stop()
 time.sleep(0.2)
 set_drive(-50, 50)
@@ -759,9 +818,9 @@ set_drive(50, -50)
 
 
 # ================================================================
-# Фаза 13: Едем по линии вперёд до стены (analog_1/2 > 800)
+# Фаза 19: Едем по линии вперёд до стены (analog_1/2 > 800)
 # ================================================================
-print("[Фаза 13] Едем по линии обратно до стены...")
+print("[Фаза 19] Едем по линии обратно до стены...")
 
 start = time.time()
 while time.time() - start < 60 and (robot.analog_1 + robot.analog_2) / 2 < 800:
@@ -784,9 +843,9 @@ while time.time() - start < 60 and (robot.analog_1 + robot.analog_2) / 2 < 800:
     time.sleep(0.05)
 
 # ================================================================
-# Фаза 14: Поворот вправо после доставки
+# Фаза 20: Поворот вправо после доставки
 # ================================================================
-print("[Фаза 14] Поворот вправо после доставки...")
+print("[Фаза 20] Поворот вправо после доставки...")
 stop()
 time.sleep(0.2)
 set_drive(50, -50)
@@ -810,6 +869,123 @@ time.sleep(0.2)
 turn_to_yaw(snap_yaw(robot.yaw - 90), timeout=3)
 stop()
 time.sleep(0.2)
+
+# ================================================================
+# Фаза 21: Поиск и наезд на рычаг
+# ================================================================
+print("[Фаза 21] Ищем рычаг...")
+
+CHECK_INTERVAL = 2.5
+FIRST_CHECK    = True
+last_check     = time.time()
+
+start = time.time()
+while time.time() - start < 60:
+    if time.time() - last_check > CHECK_INTERVAL:
+        if FIRST_CHECK:
+            FIRST_CHECK    = False
+            CHECK_INTERVAL = 4.0
+        stop()
+        print("Проверяем поворот налево...")
+        set_drive(-50, 50)
+        time.sleep(TURN_TIME)
+        stop()
+        frame = robot.camera_image
+        last_check = time.time()
+        while frame is None:
+            frame = robot.camera_image
+        direction, debug_frame = detect_lever(frame)
+        if direction is not None:
+            break
+        else:
+            set_drive(50, -50)
+            time.sleep(TURN_TIME)
+            stop()
+    frame      = robot.camera_image
+    cam_error  = None
+    if frame is not None:
+        cam_error, frame = camera_correction(frame)
+
+    correction = cam_error * K_CAMERA if cam_error is not None else 0
+    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
+    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    set_drive(left, right)
+
+    if frame is not None:
+        cv2.imshow("АГРОБОТ", frame)
+        cv2.waitKey(1)
+
+    time.sleep(0.05)
+
+stop()
+
+print("  Опускаем лифт...")
+robot.set_angle_servo(5, 1)     # лифт вниз (0 = низ)
+time.sleep(2.0)
+
+# Закрываем клешню
+print("  Открываем клешню...")
+robot.set_angle_servo(300, 2)     # клешня закрыта (0 = закрыто)
+time.sleep(1.5)
+
+print("Рычаг найден, наезжаем...")
+start = time.time()
+while time.time() - start < 15:
+    frame = robot.camera_image
+    if frame is None:
+        time.sleep(0.05)
+        continue
+
+    direction, debug_frame = detect_lever(frame)
+
+    cv2.imshow("АГРОБОТ", debug_frame)
+    cv2.waitKey(1)
+
+    if direction is None:
+        # Рычаг пропал — скорее всего уже под роботом
+        print("Рычаг под роботом — стоп!")
+        break
+
+    # Едем на рычаг: коррекция по direction как у ящика
+    correction = direction * K_BOX
+    left  = max(-100, min(100, APPROACH_SPEED + correction))
+    right = max(-100, min(100, APPROACH_SPEED - correction))
+    set_drive(left, right)
+    time.sleep(0.05)
+
+stop()
+
+print("[Фаза 15] Рычаг активирован.")
+
+turn_to_yaw(snap_yaw(robot.yaw + 90))
+turn_to_yaw(snap_yaw(robot.yaw + 90))
+
+start = time.time()
+while time.time() - start < 60:
+    frame      = robot.camera_image
+    cam_error = None
+    if frame is not None:
+        cam_error, frame = camera_correction(frame)  # сначала обычный режим
+        if cam_error is None:
+            cam_error, frame = camera_correction(frame, wide=True)
+            if cam_error is None:
+                break
+
+    correction = cam_error * K_CAMERA if cam_error is not None else 0
+    left  = max(-100, min(100, AFTER_TURN_SPEED + correction))
+    right = max(-100, min(100, AFTER_TURN_SPEED - correction))
+    set_drive(left, right)
+
+    if frame is not None:
+        cv2.imshow("АГРОБОТ", frame)
+        cv2.waitKey(1)
+
+    time.sleep(0.05)
+
+turn_to_yaw(snap_yaw(robot.yaw - 90))
+drive_forward_yaw(snap_yaw(robot.yaw))
+turn_to_yaw(snap_yaw(robot.yaw + 90))
+drive_forward_yaw(snap_yaw(robot.yaw), 50, 60)
 
 # ================================================================
 # Финал
