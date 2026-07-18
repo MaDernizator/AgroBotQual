@@ -918,8 +918,8 @@ while time.time() - start < 60:
             set_drive(50, -50)
             time.sleep(TURN_TIME)
             stop()
-    frame      = robot.camera_image
-    cam_error  = None
+    frame = robot.camera_image
+    cam_error = None
     if frame is not None:
         cam_error, frame = camera_correction(frame)
 
